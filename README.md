@@ -3,7 +3,11 @@
 Delivers **confirmed** address transfers to address-behaviour analysis, keeping
 the published chain view consistent with the chain source: reorgs and head
 rollbacks withdraw abandoned and insufficiently confirmed transfers, and a slow
-or late ingestion round can never overwrite a newer published view.
+or late ingestion round can never overwrite a newer published view.  A
+**materialized query projection** (block list, per-address index, counts) is
+precomputed and switched atomically with every published revision, so
+long-chain queries reuse precomputed results instead of recomputing the view
+from SQLite on every request.
 
 Two FastAPI + SQLite instances share one volume, plus a controllable local HTTP
 chain source. Delivered as launchable Docker Compose.
@@ -59,7 +63,7 @@ Local (no Docker), Python 3.11+:
 ```bash
 python -m venv .venv && . .venv/bin/activate
 pip install -r requirements-dev.txt
-pytest -q                      # 25 end-to-end tests
+pytest -q                      # 36 end-to-end tests
 
 # terminals 1-3
 SOURCE_STATE_PATH=/tmp/chain-source.json INITIAL_BLOCKS=6 \
@@ -93,6 +97,23 @@ DB_PATH=/tmp/chain.db CHAIN_SOURCE_URL=http://127.0.0.1:9100 INSTANCE_ID=api-b \
   once per round. `commit_view` runs in one SQLite `BEGIN IMMEDIATE`
   transaction that compares the target revision against `published_revision`
   and refuses (`stale`) when a revision at least as new is already published.
+* **Long-chain queries reuse a materialized projection.** Every publish
+  transaction also rebuilds `projection_blocks` (per-block transfer counts
+  with a running total), `projection_addresses` (per-address transfers with
+  precomputed confirmations) and `projection_meta` (view id, totals, build
+  time). Queries for the same revision then read precomputed rows: the counts
+  are O(1) lookups and address answers are an index scan filtered by
+  `min_confirmations` — no per-query recomputation of the chain view, the
+  counts or the address result.
+* **The projection switches atomically per revision.** It is written in the
+  same transaction as `chain_blocks` and `sync_state`, so advance, reorg,
+  rollback and same-head revision bumps switch it together with the view, a
+  failed publish leaves the previous projection untouched, and two instances
+  sharing the database never read a mixed revision (each query checks the
+  projection's revision against `sync_state` inside one read transaction; a
+  missing or stale projection falls back to computing from `chain_blocks`
+  until the next publish). `/chain/projection` reports the projection's
+  revision, size, build time and `in_sync` flag.
 * **Failures keep the published view.** Blocks are fetched into an immutable
   cache first; the published view and progress only change in the final commit.
   Any head/block/validation error leaves the previous view intact and the
@@ -117,7 +138,8 @@ DB_PATH=/tmp/chain.db CHAIN_SOURCE_URL=http://127.0.0.1:9100 INSTANCE_ID=api-b \
 | ------ | -------------------------- | ----------- |
 | GET    | `/transfers?address=…`     | Confirmed transfers + full chain view + head basis |
 | GET    | `/chain/blocks`            | Full published chain view + head basis |
-| GET    | `/chain/status`            | Progress: revision, head, errors, lease, follower state |
+| GET    | `/chain/projection`        | Materialized projection status: revision, size, build time, `in_sync` |
+| GET    | `/chain/status`            | Progress: revision, head, errors, lease, follower state, projection |
 | GET    | `/health`                  | Ops health for Compose |
 | POST   | `/admin/sync`              | Run exactly one round synchronously and report it |
 | GET    | `/admin/rounds`            | Recent round audit log |
@@ -154,12 +176,54 @@ A transfer is `{txid, from_address, to_address, amount}` with an integer
   fetched, including abandoned branches.
 * `chain_blocks` — the published canonical height→hash view.
 * `sync_state` — published revision, head, status, last round/error, round count.
+* `projection_blocks` — materialized published view: one row per block with
+  `tx_count` and `cum_tx_count` (running total) for O(1) count lookups.
+* `projection_addresses` — per-address transfer index for the published
+  revision, with confirmations precomputed at publish time; queries only
+  filter `confirmations >= min_confirmations`.
+* `projection_meta` — the projection's revision, view id, head, totals and
+  build time; its revision must match `sync_state.published_revision`.
 * `ingest_lease` — one active follower across instances.
 * `ingest_rounds` — bounded audit trail (last 500 rounds).
 
+The three projection tables are written only inside the publish transaction
+(or the startup reconcile), so they always describe exactly one published
+revision.
+
+## Long-chain demo (Compose + /docs)
+
+```bash
+docker compose up --build
+bash scripts/demo-long-chain.sh      # or drive the same calls from /docs
+```
+
+The script (curl + jq; override ports via `API_A`/`API_B`/`SOURCE`) walks
+through the projection lifecycle, and every step is also clickable in Swagger
+UI at http://localhost:8000/docs (source controls at
+http://localhost:9100/docs):
+
+1. **Build a long chain** — `POST /admin/advance` on the source with e.g.
+   `{"count": 300, "transfers_per_block": 8}`, then `POST /admin/sync` on the
+   API. `GET /chain/projection` shows the precomputed projection
+   (`blocks`, `addresses`, `transfers`, `build_ms`) with `in_sync: true`.
+2. **Repeated queries reuse it** — repeated `GET /transfers?address=…` calls
+   return byte-identical `chain_view`s, the projection's `built_at` does not
+   change, and `?min_confirmations=100` is just a stricter filter over the
+   precomputed rows.
+3. **Reorg** — `POST /admin/fork` + sync: the projection switches atomically
+   to the new revision/head on both instances.
+4. **Rollback** — `POST /admin/rollback` + sync: the projection switches to
+   the lower head; confirmations are recomputed at publish time, so
+   now-too-shallow transfers leave every address answer.
+5. **Failed publish** — `POST /admin/faults` + advance + sync fails; the
+   projection is retained unchanged (`built_at` identical, `in_sync` still
+   true) and queries keep serving the last published revision.
+6. **Recovery** — clear faults + sync: the projection switches to the newest
+   revision; instance B (`:8001`) reports the identical projection.
+
 ## Verified behaviour (tests)
 
-`pytest` runs 25 end-to-end tests against real HTTP servers on ephemeral
+`pytest` runs 36 end-to-end tests against real HTTP servers on ephemeral
 ports and a real SQLite file. They cover: the two-block confirmation cutoff and
 that it cannot be lowered; every address seeing the identical complete view;
 reorg suffix-only update with no common-prefix refetch (asserted from
@@ -169,7 +233,15 @@ leaving the published view intact; slow pulls not delaying queries; genuinely
 late rounds rejected after a newer publish; two instances converging from a
 shared volume; restart resuming without refetching; crash-cached blocks reused;
 same-head revision bumps; source state persistence; and `/docs`/console
-availability.
+availability. Projection-specific tests cover: projection answers identical to
+the from-scratch computation for every address and confirmation override;
+same-revision queries reusing the precomputed projection without a rebuild;
+atomic projection switches on reorg, rollback and same-head revision bumps;
+the projection retained unchanged through failed publishes; fallback to the
+legacy computation when the projection is missing, with startup reconcile
+rebuilding it; two instances sharing one projection; `in_sync` never violated
+during concurrent commits from two instances; and a 120-block long chain
+served from the projection including a deep reorg.
 
 ## Known limits
 
@@ -195,12 +267,13 @@ availability.
 
 | Check | Result |
 | --- | --- |
-| `pytest` (25 end-to-end tests, real HTTP servers + real SQLite file) | pass, against both the local environment and the exact pinned Docker dependency set (`PYTHONPATH=/tmp/pins`) |
-| Both ASGI apps under Uvicorn with pinned deps (`chain_source.main:app`, `app.main:app`) | started, served `/health`, `/docs`, `/`, queries, followed source advances and a fork over real sockets |
-| Two instances sharing one SQLite file | identical `/chain/blocks` views; only one held the lease; failed instance kept serving |
-| Restart continuation | persisted view served before any round; subsequent rounds fetched only new blocks (per-hash counters on the source unchanged for known blocks) |
-| `ruff check` / `ruff format` | clean |
-| `docker compose up --build` | **not executed** — no Docker daemon in this environment |
+| `pytest` (36 end-to-end tests, real HTTP servers + real SQLite file) | pass |
+| Both ASGI apps under Uvicorn (`chain_source.main:app`, `app.main:app`), two API instances on one SQLite file | started, served `/health`, `/docs`, `/`, queries; identical `/chain/projection` and `chain_view` on both instances |
+| Long-chain live run (300 blocks × 8 transfers) | projection built once at publish (34 ms); 20 repeated queries returned one identical view with `built_at` unchanged; `min_confirmations=100` override filtered precomputed rows |
+| Reorg / rollback / fault injection over live HTTP | projection switched atomically per published revision; retained unchanged through failed publishes (`in_sync` stayed true); switched to newest revision after recovery |
+| Cold start + restart | no projection before first publish; first commit built it atomically; restart served the persisted projection without rebuild |
+| `scripts/demo-long-chain.sh` against a live 3-service stack | all steps passed, including dual-instance projection equality |
+| `docker compose up --build` | **not executed** — no Docker daemon in this environment; the Compose definition and Dockerfiles are unchanged and were validated by YAML inspection plus the Uvicorn runs above |
 
 Not implemented / out of scope: authentication and rate limiting on the API and
 demo console, a real chain node adapter, cross-host replica coordination,

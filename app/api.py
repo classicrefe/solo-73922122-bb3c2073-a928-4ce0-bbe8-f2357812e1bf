@@ -123,8 +123,12 @@ def create_app(
             "the published head are served (minimum confirmations is "
             f"{settings.min_confirmations}). Reorgs and head rollbacks withdraw "
             "abandoned or insufficiently confirmed transfers, and a late round "
-            "can never overwrite a newer published revision. Progress and chain "
-            "view are persisted in SQLite, so a restart resumes following."
+            "can never overwrite a newer published revision. A materialized "
+            "query projection (block list, per-address index, counts) is "
+            "precomputed and switched atomically with each published revision, "
+            "so long-chain queries reuse precomputed results instead of "
+            "recomputing the view. Progress and chain view are persisted in "
+            "SQLite, so a restart resumes following."
         ),
         lifespan=lifespan,
     )
@@ -176,7 +180,23 @@ def create_app(
             "min_confirmations": settings.min_confirmations,
             "follower": ingestor.state,
             "lease": db.lease_info(),
+            "projection": db.projection_info(),
         }
+
+    @app.get("/chain/projection", tags=["chain"])
+    def chain_projection() -> dict[str, Any]:
+        """Status of the materialized query projection.
+
+        The projection (block list with per-block transfer counts, per-address
+        transfer index, view id and totals) is precomputed inside the publish
+        transaction and switched atomically per published revision, so long
+        chains are served without recomputing the view on every query.
+        ``in_sync`` reports whether the projection matches the published
+        revision; when it does not (only possible on a partially restored
+        database) queries transparently fall back to computing from
+        ``chain_blocks`` until the next publish.
+        """
+        return db.projection_info()
 
     @app.get("/chain/blocks", tags=["chain"])
     def chain_blocks() -> dict[str, Any]:
@@ -446,7 +466,15 @@ async function refresh() {
       ? `serving rev ${v.published_revision} · head ${v.head_height}`
       : 'no view yet';
     pill.className = 'pill ' + (v.serving ? 'ok' : 'bad');
-    $('view').textContent = JSON.stringify(v, null, 2);
+    let proj = null;
+    try { proj = await api('/chain/projection'); } catch (e) { /* older peer */ }
+    $('view').textContent = JSON.stringify(v, null, 2) +
+      (proj && proj.projection
+        ? `\n\nprojection: rev ${proj.projection.revision} · ` +
+          `${proj.projection.blocks} blocks · ${proj.projection.addresses} addresses · ` +
+          `${proj.projection.transfers} transfers · built in ${proj.projection.build_ms}ms · ` +
+          `in_sync=${proj.in_sync}`
+        : '\n\nprojection: none');
     const rounds = await api('/admin/rounds?limit=6');
     $('rounds').innerHTML = '<table><tr><th>round</th><th>inst</th><th>outcome</th>' +
       '<th>obs rev/h</th><th>anc</th><th>fetched/reused</th><th>ms</th></tr>' +
