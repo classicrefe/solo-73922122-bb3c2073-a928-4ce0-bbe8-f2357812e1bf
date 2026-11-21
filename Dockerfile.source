@@ -1,0 +1,25 @@
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /srv
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY chain_source ./chain_source
+
+# The chain source keeps its state on a volume so source restarts are seamless.
+RUN useradd --create-home --uid 10001 appuser \
+    && mkdir -p /source-data \
+    && chown -R appuser:appuser /srv /source-data
+USER appuser
+
+EXPOSE 9100
+
+HEALTHCHECK --interval=5s --timeout=3s --start-period=5s --retries=12 \
+  CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:9100/health', timeout=2).status==200 else 1)"
+
+CMD ["uvicorn", "chain_source.main:app", "--host", "0.0.0.0", "--port", "9100"]

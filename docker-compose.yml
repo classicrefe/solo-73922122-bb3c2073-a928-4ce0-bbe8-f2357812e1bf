@@ -1,0 +1,88 @@
+name: confirmed-transfers
+
+# Two API instances share one named volume (the SQLite database + WAL files).
+# Both follow the source; a SQLite lease ensures only one publishes at a time,
+# and the revision guard in every commit makes overlapping rounds harmless.
+# The chain source keeps its own state on a second volume.
+
+services:
+  chain-source:
+    build:
+      context: .
+      dockerfile: Dockerfile.source
+    environment:
+      SOURCE_STATE_PATH: /source-data/chain.json
+      INITIAL_BLOCKS: "6"
+      INITIAL_TRANSFERS_PER_BLOCK: "2"
+    volumes:
+      - source-data:/source-data
+    ports:
+      - "9100:9100"
+    healthcheck:
+      test:
+        ["CMD", "python", "-c",
+         "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:9100/health', timeout=2).status==200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+  api-a:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    environment:
+      INSTANCE_ID: api-a
+      DB_PATH: /data/chain.db
+      CHAIN_SOURCE_URL: http://chain-source:9100
+      MIN_CONFIRMATIONS: "3"
+      POLL_INTERVAL_SECONDS: "1"
+      INGEST_LEASE_SECONDS: "15"
+    volumes:
+      - api-data:/data
+    ports:
+      - "8000:8000"
+    depends_on:
+      chain-source:
+        condition: service_healthy
+    healthcheck:
+      test:
+        ["CMD", "python", "-c",
+         "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).status==200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+  api-b:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    environment:
+      INSTANCE_ID: api-b
+      DB_PATH: /data/chain.db
+      CHAIN_SOURCE_URL: http://chain-source:9100
+      MIN_CONFIRMATIONS: "3"
+      POLL_INTERVAL_SECONDS: "1"
+      INGEST_LEASE_SECONDS: "15"
+    volumes:
+      - api-data:/data
+    ports:
+      - "8001:8000"
+    depends_on:
+      chain-source:
+        condition: service_healthy
+      api-a:
+        condition: service_healthy
+    healthcheck:
+      test:
+        ["CMD", "python", "-c",
+         "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).status==200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+volumes:
+  api-data:
+  source-data:
